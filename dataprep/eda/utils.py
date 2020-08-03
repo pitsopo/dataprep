@@ -2,7 +2,9 @@
 """
 import logging
 from math import ceil
-from typing import Any, Union
+from typing import Any, Tuple, Union, cast
+
+import dask.array as da
 import dask.dataframe as dd
 import numpy as np
 import pandas as pd
@@ -38,7 +40,7 @@ def to_dask(df: Union[pd.DataFrame, dd.DataFrame]) -> dd.DataFrame:
         return df
 
     df_size = df.memory_usage(deep=True).sum()
-    npartitions = ceil(df_size / 128 / 1024 / 1024)
+    npartitions = ceil(df_size / 128 / 1024 / 1024)  # 128 MB partition size
     return dd.from_pandas(df, npartitions=npartitions)
 
 
@@ -93,3 +95,43 @@ def fuse_missing_perc(name: str, perc: float) -> str:
         return name
 
     return f"{name} ({perc:.1%})"
+
+
+class DataArray:
+    """DataArray is similar to dd.DataFrame, but already
+    has its data stored in an da.Array with known chunk size.
+
+    Creating a DataArray requires a small read on the data length.
+    """
+
+    _ddf: dd.DataFrame
+    _data: da.Array
+    _columns: pd.Index
+
+    def __init__(self, df: Union[pd.DataFrame, dd.DataFrame]) -> None:
+        sup = super()
+
+        if isinstance(df, dd.DataFrame):
+            sup.__setattr__("_ddf", df)
+        else:
+            df_size = df.memory_usage(deep=True).sum()
+            npartitions = ceil(df_size / 128 / 1024 / 1024)
+            sup.__setattr__("_ddf", dd.from_pandas(df, npartitions=npartitions))
+
+        sup.__setattr__("_data", self._ddf.to_dask_array(lengths=True))
+        sup.__setattr__("_columns", pd.Index([str(col) for col in self._ddf.columns]))
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        """Return the shape of the data"""
+        return cast(Tuple[int, ...], self._data.shape)
+
+    @property
+    def values(self) -> da.Array:
+        """Return the array representation of the data"""
+        return self._data
+
+    @property
+    def columns(self) -> pd.Index:
+        """Return the columns of the DataFrame"""
+        return self._columns
