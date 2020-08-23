@@ -20,7 +20,7 @@ from ...dtypes import (
     Nominal,
     detect_dtype,
     drop_null,
-    get_dtype_cnts,
+    get_dtype_cnts_and_num_cols,
     is_dtype,
 )
 from ...intermediate import Intermediate
@@ -70,7 +70,7 @@ def compute_overview(
 
     datas: List[Any] = []
     col_names_dtypes: List[Tuple[str, DType]] = []
-    num_cols: List[str] = []
+
     for col in df.columns:
         srs = df[col]
         col_dtype = detect_dtype(srs, dtype)
@@ -89,14 +89,13 @@ def compute_overview(
             ## if cfg.hist_enable or cfg.any_insights("hist"):
             datas.append(calc_cont_col(drop_null(srs), bins))
             col_names_dtypes.append((col, Continuous()))
-            num_cols.append(col)
         elif is_dtype(col_dtype, DateTime()):
             datas.append(dask.delayed(_calc_line_dt)(df[[col]], timeunit))
             col_names_dtypes.append((col, DateTime()))
         else:
             raise UnreachableError
 
-    ov_stats = calc_stats(df, get_dtype_cnts(df, dtype), num_cols)
+    ov_stats = calc_stats(df, dtype)
     datas, ov_stats = dask.compute(datas, ov_stats)
 
     # extract the plotting data, and detect and format the insights
@@ -236,9 +235,7 @@ def calc_nom_col(
 
 
 ## def calc_stats(srs: dd.Series, dtype_cnts: Dict[str, int], num_cols: List[str], cfg: Config)
-def calc_stats(
-    df: dd.DataFrame, dtype_cnts: Dict[str, int], num_cols: Optional[List[str]] = None
-) -> Dict[str, Any]:
+def calc_stats(df: dd.DataFrame, dtype: Optional[DTypeDef]) -> Dict[str, Any]:
     """
     Calculate the statistics for plot(df) from a DataFrame
 
@@ -255,6 +252,7 @@ def calc_stats(
     stats = {"nrows": df.shape[0]}
 
     ## if cfg.stats_enable
+    dtype_cnts, num_cols = get_dtype_cnts_and_num_cols(df, dtype)
     stats["nrows"] = df.shape[0]
     stats["ncols"] = df.shape[1]
     stats["npresent_cells"] = df.count().sum()

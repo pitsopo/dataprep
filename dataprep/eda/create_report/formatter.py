@@ -2,22 +2,37 @@
     This module implements the formatting
     for create_report(df) function.
 """
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
 from bokeh.embed import components
 from bokeh.models import Title
 from bokeh.plotting import Figure
+import dask
 
-from ..distribution import compute, render
+from ..distribution import render
 from ..distribution.compute.overview import calc_stats
-from ..distribution.render import _format_values
-from ..correlation import compute_correlation, render_correlation
-from ..dtypes import Continuous, DateTime, Nominal, detect_dtype, is_dtype
+from ..distribution.compute.univariate import cont_comps, nom_comps
+from ..distribution.render import (
+    _format_values,
+    format_ov_stats,
+    format_num_stats,
+    format_cat_stats,
+)
+from ..correlation import render_correlation
+from ..dtypes import (
+    Continuous,
+    # DateTime,
+    Nominal,
+    detect_dtype,
+    is_dtype,
+    get_dtype_cnts_and_num_cols,
+)
 from ..intermediate import Intermediate
-from ..missing import compute_missing, render_missing
-from ..utils import is_notebook
+from ..missing import render_missing
+from ..missing.compute import dlyd_missing_comps
+from ..utils import is_notebook, to_dask
 
 if is_notebook():
     from tqdm.notebook import tqdm
@@ -73,192 +88,298 @@ def format_basic(df: pd.DataFrame, comps: Dict[str, Any]) -> Dict[str, Any]:
         A dictionary in which formatted data is stored.
         This variable acts like an API in passing data to the template engine.
     """
-
     # pylint: disable=too-many-locals, too-many-statements, broad-except, too-many-branches
-    num_col: List[str] = []
+
+    df = to_dask(df)
+    data: Dict[str, Any] = {}
+    dtype = None  # TODO fix dtype
+
+    _, num_cols = get_dtype_cnts_and_num_cols(df, dtype)
+    data["ov"] = calc_stats(df, dtype)
+
     for col in df.columns:
         if is_dtype(detect_dtype(df[col]), Continuous()):
-            num_col.append(col)
+            data[col] = cont_comps(df[col], 10)
+        elif is_dtype(detect_dtype(df[col]), Nominal()):
+            data[col] = nom_comps(df[col], 10, True, 10, 30, True, False, False)
 
-    with tqdm(
-        total=7 + 2 * len(df.columns) + len(num_col) ** 2, dynamic_ncols=True
-    ) as pbar:
-        # Missing Values
-        pbar.set_description(desc="Computing Missing Values")
-        pbar.update(1)
-        itmdt = compute_missing(df)
-        if any(itmdt["data_total_missing"].values()):
-            try:
-                pbar.set_description(desc="Formating Missing Values")
-                pbar.update(1)
-                comps["has_missing"] = True
-                rendered = render_missing(itmdt)
-                comps["missing"] = components(
-                    [
-                        _morph_figure(
-                            tab.child.children[0],
-                            sizing_mode="stretch_width",
-                            title=Title(
-                                text=tab.title, align="center", text_font_size="20px"
-                            ),
-                        )
-                        for tab in rendered.tabs
-                    ]
-                )
-            except Exception as error:
-                pbar.set_description(desc="Something Happened...")
-                pbar.update(1)
-                comps["has_missing"] = True
-                comps["missing"] = (0, {"error": error})  # same template for rendering
-        else:
-            pbar.set_description(desc="Skipping Missing Values")
-            pbar.update(1)
-            comps["has_missing"] = False
+    data["scat"] = df.map_partitions(
+        lambda x: x.sample(min(1000, x.shape[0])), meta=df
+    )[num_cols]
+    # data["corr"] = compute_correlation(df[num_cols])
+    data["miss"] = dlyd_missing_comps(df, 30)
 
-        # Overview
-        counter = {"Categorical": 0, "Numerical": 0, "Datetime": 0}
-        for column in df.columns:
-            column_dtype = detect_dtype(df[column])
-            if is_dtype(column_dtype, Nominal()):
-                counter["Categorical"] += 1
-            elif is_dtype(column_dtype, Continuous()):
-                counter["Numerical"] += 1
-            elif is_dtype(column_dtype, DateTime()):
-                counter["Datetime"] += 1
+    (data,) = dask.compute(data)
 
-        pbar.set_description(desc="Computing Overview")
-        pbar.update(1)
-        stats = calc_stats(df, counter)
+    comps = {}
+    comps["overview"] = format_ov_stats(data["ov"])
 
-        pbar.set_description(desc="Formating Overview")
-        pbar.update(1)
+    comps["variables"] = {}
+    for col in df.columns:
+        if is_dtype(detect_dtype(df[col]), Continuous()):
+            itmdt = Intermediate(
+                col=col, data=data[col], visual_type="numerical_column"
+            )
+            rndrd = render(itmdt)
+            stats = format_num_stats(data[col])
+        elif is_dtype(detect_dtype(df[col]), Nominal()):
+            itmdt = Intermediate(
+                col=col, data=data[col], visual_type="categorical_column"
+            )
+            rndrd = render(itmdt)
+            stats = format_cat_stats(
+                data[col]["stats"], data[col]["len_stats"], data[col]["letter_stats"]
+            )
 
-        comps["overview"] = _format_stats(stats, "overview")
+        comps["variables"][col] = {
+            "tabledata": stats,
+            "plots": components(
+                [
+                    _morph_figure(
+                        tab.child.children[0]
+                        if hasattr(tab.child, "children")
+                        else tab.child,
+                        plot_width=280,
+                        plot_height=250,
+                        title=Title(text=tab.title, align="center"),
+                    )
+                    for tab in rndrd.tabs[1:]
+                ]
+            ),  # skip Div
+            "col_type": itmdt.visual_type.replace("_column", ""),
+        }
 
-        # Variables
-        comps["variables"] = {}
-        for col in df.columns:
-            try:
-                pbar.set_description(desc=f"Computing {col}")
-                pbar.update(1)
-                itmdt = compute(df, col, top_words=15)
+    comps["has_interaction"] = True
+    itmdt = Intermediate(data=data["scat"], visual_type="correlation_crossfilter",)
+    rendered = render_correlation(itmdt)
+    comps["interactions"] = components(
+        _morph_figure(rendered, sizing_mode="stretch_width")
+    )
 
-                pbar.set_description(desc=f"Formating {col}")
-                pbar.update(1)
-                rendered = render(itmdt)
-                data = itmdt["stats"]  # pylint: disable=unsubscriptable-object
-                if is_dtype(detect_dtype(df[col]), Continuous()):
-                    stats = _format_stats(data, "var_num")
-                elif is_dtype(detect_dtype(df[col]), Nominal()):
-                    stats = _format_stats(data, "var_cat")
-                elif is_dtype(detect_dtype(df[col]), DateTime()):
-                    stats = _format_stats(data, "var_dt")
-                else:
-                    raise TypeError(f"Unsupported dtype: {detect_dtype(df[col])}")
+    comps["has_correlation"] = False
+    # data["corr"] = compute_correlation(df[num_cols])
+    # rendered = render_correlation(data["corr"])
+    # comps["correlations"] = components(
+    #     [
+    #         _morph_figure(
+    #             tab.child,
+    #             sizing_mode="stretch_width",
+    #             title=Title(
+    #                 text=tab.title, align="center", text_font_size="20px"
+    #             ),
+    #         )
+    #         for tab in rendered.tabs
+    #     ]
+    # )
 
-                comps["variables"][col] = {
-                    "tabledata": stats,
-                    "plots": components(
-                        [
-                            _morph_figure(
-                                tab.child.children[0]
-                                if hasattr(tab.child, "children")
-                                else tab.child,
-                                plot_width=280,
-                                plot_height=250,
-                                title=Title(text=tab.title, align="center"),
-                            )
-                            for tab in rendered.tabs[1:]
-                        ]
-                    ),  # skip Div
-                    "col_type": itmdt.visual_type.replace("_column", ""),
-                }
-            except Exception as error:
-                pbar.set_description(desc=f"Something Happened...")
-                pbar.update(2)
-                comps["variables"][col] = {"error": error, "plots": (0, 0)}
+    comps["has_missing"] = True
+    spectrum, null_perc, bars, heatmap, dendrogram = data["miss"]
+    itmdt = Intermediate(
+        data_total_missing={col: null_perc[i] for i, col in enumerate(df.columns)},
+        data_spectrum=spectrum,
+        data_bars=bars,
+        data_heatmap=heatmap,
+        data_dendrogram=dendrogram,
+        visual_type="missing_impact",
+    )
+    rendered = render_missing(itmdt)
+    comps["missing"] = components(
+        [
+            _morph_figure(
+                tab.child.children[0],
+                sizing_mode="stretch_width",
+                title=Title(text=tab.title, align="center", text_font_size="20px"),
+            )
+            for tab in rendered.tabs
+        ]
+    )
 
-        # Correlations
-        try:
-            pbar.set_description(desc="Computing Correlations")
-            pbar.update(1)
-            itmdt = compute_correlation(df)
-            if len(itmdt) != 0:
-                pbar.set_description(desc="Formating Correlations")
-                pbar.update(1)
-                comps["has_correlation"] = True
-                rendered = render_correlation(itmdt)
-                comps["correlations"] = components(
-                    [
-                        _morph_figure(
-                            tab.child,
-                            sizing_mode="stretch_width",
-                            title=Title(
-                                text=tab.title, align="center", text_font_size="20px"
-                            ),
-                        )
-                        for tab in rendered.tabs
-                    ]
-                )
-            else:
-                pbar.set_description(desc="Skipping Correlations")
-                pbar.update(1)
-                comps["has_correlation"] = False
-        except Exception as error:
-            pbar.set_description(desc="Something Happened...")
-            pbar.update(2)
-            comps["has_correlation"] = True
-            comps["correlations"] = (0, {"error": error})  # same template for rendering
-
-        # Interactions
-        df_coeffs: pd.DataFrame = pd.DataFrame({})
-        if len(num_col) > 1:
-            comps["has_interaction"] = True
-            # set initial x,y axis value
-            df_scatter = df.loc[:, num_col]
-            df_scatter.loc[:, "__x__"] = df_scatter.iloc[:, 0]
-            df_scatter.loc[:, "__y__"] = df_scatter.iloc[:, 0]
-            try:
-                for v_1 in num_col:
-                    for v_2 in num_col:
-                        pbar.set_description(
-                            desc=f"Computing Interactions: {v_1}-{v_2}"
-                        )
-                        pbar.update(1)
-                        itmdt = compute_correlation(df, v_1, v_2)
-                        coeff_a, coeff_b = itmdt["coeffs"]
-                        line_x = np.asarray(
-                            [
-                                itmdt["data"].iloc[:, 0].min(),
-                                itmdt["data"].iloc[:, 0].max(),
-                            ]
-                        )
-                        line_y = coeff_a * line_x + coeff_b
-                        df_coeffs[f"{v_1}{v_2}x"] = line_x
-                        df_coeffs[f"{v_1}{v_2}y"] = line_y
-                df_coeffs.loc[:, "__x__"] = df_coeffs.iloc[:, 0]
-                df_coeffs.loc[:, "__y__"] = df_coeffs.iloc[:, 1]
-                itmdt = Intermediate(
-                    coeffs=df_coeffs,
-                    data=df_scatter,
-                    visual_type="correlation_crossfilter",
-                )
-                pbar.set_description(desc="Formating Interactions")
-                pbar.update(1)
-                rendered = render_correlation(itmdt)
-                comps["interactions"] = components(
-                    _morph_figure(rendered, sizing_mode="stretch_width")
-                )
-            except Exception as error:
-                pbar.set_description(desc="Something Happened...")
-                pbar.update(1)
-                comps["interactions"] = (0, {"error": error})
-        else:
-            pbar.set_description(desc="Skipping Interactions")
-            pbar.update(len(num_col) ** 2 + 1)
-            comps["has_interaction"] = False
-        pbar.set_description(desc="Report has been created!")
     return comps
+
+    # num_col: List[str] = []
+    # for col in df.columns:
+    #     if is_dtype(detect_dtype(df[col]), Continuous()):
+    #         num_col.append(col)
+
+    # with tqdm(
+    #     total=7 + 2 * len(df.columns) + len(num_col) ** 2, dynamic_ncols=True
+    # ) as pbar:
+    #     # Missing Values
+    #     pbar.set_description(desc="Computing Missing Values")
+    #     pbar.update(1)
+    #     itmdt = compute_missing(df)
+    #     if any(itmdt["data_total_missing"].values()):
+    #         try:
+    #             pbar.set_description(desc="Formating Missing Values")
+    #             pbar.update(1)
+    #             comps["has_missing"] = True
+    #             rendered = render_missing(itmdt)
+    #             comps["missing"] = components(
+    #                 [
+    #                     _morph_figure(
+    #                         tab.child.children[0],
+    #                         sizing_mode="stretch_width",
+    #                         title=Title(
+    #                             text=tab.title, align="center", text_font_size="20px"
+    #                         ),
+    #                     )
+    #                     for tab in rendered.tabs
+    #                 ]
+    #             )
+    #         except Exception as error:
+    #             pbar.set_description(desc="Something Happened...")
+    #             pbar.update(1)
+    #             comps["has_missing"] = True
+    #             comps["missing"] = (0, {"error": error})  # same template for rendering
+    #     else:
+    #         pbar.set_description(desc="Skipping Missing Values")
+    #         pbar.update(1)
+    #         comps["has_missing"] = False
+
+    #     # Overview
+    #     counter = {"Categorical": 0, "Numerical": 0, "Datetime": 0}
+    #     for column in df.columns:
+    #         column_dtype = detect_dtype(df[column])
+    #         if is_dtype(column_dtype, Nominal()):
+    #             counter["Categorical"] += 1
+    #         elif is_dtype(column_dtype, Continuous()):
+    #             counter["Numerical"] += 1
+    #         elif is_dtype(column_dtype, DateTime()):
+    #             counter["Datetime"] += 1
+
+    #     pbar.set_description(desc="Computing Overview")
+    #     pbar.update(1)
+    #     stats = calc_stats(df, counter)
+
+    #     pbar.set_description(desc="Formating Overview")
+    #     pbar.update(1)
+
+    #     comps["overview"] = _format_stats(stats, "overview")
+
+    #     # Variables
+    #     comps["variables"] = {}
+    #     for col in df.columns:
+    #         try:
+    #             pbar.set_description(desc=f"Computing {col}")
+    #             pbar.update(1)
+    #             itmdt = compute(df, col, top_words=15)
+
+    #             pbar.set_description(desc=f"Formating {col}")
+    #             pbar.update(1)
+    #             rendered = render(itmdt)
+    #             data = itmdt["stats"]  # pylint: disable=unsubscriptable-object
+    #             if is_dtype(detect_dtype(df[col]), Continuous()):
+    #                 stats = _format_stats(data, "var_num")
+    #             elif is_dtype(detect_dtype(df[col]), Nominal()):
+    #                 stats = _format_stats(data, "var_cat")
+    #             elif is_dtype(detect_dtype(df[col]), DateTime()):
+    #                 stats = _format_stats(data, "var_dt")
+    #             else:
+    #                 raise TypeError(f"Unsupported dtype: {detect_dtype(df[col])}")
+
+    #             comps["variables"][col] = {
+    #                 "tabledata": stats,
+    #                 "plots": components(
+    #                     [
+    #                         _morph_figure(
+    #                             tab.child.children[0]
+    #                             if hasattr(tab.child, "children")
+    #                             else tab.child,
+    #                             plot_width=280,
+    #                             plot_height=250,
+    #                             title=Title(text=tab.title, align="center"),
+    #                         )
+    #                         for tab in rendered.tabs[1:]
+    #                     ]
+    #                 ),  # skip Div
+    #                 "col_type": itmdt.visual_type.replace("_column", ""),
+    #             }
+    #         except Exception as error:
+    #             pbar.set_description(desc=f"Something Happened...")
+    #             pbar.update(2)
+    #             comps["variables"][col] = {"error": error, "plots": (0, 0)}
+
+    #     # Correlations
+    #     try:
+    #         pbar.set_description(desc="Computing Correlations")
+    #         pbar.update(1)
+    #         itmdt = compute_correlation(df)
+    #         if len(itmdt) != 0:
+    #             pbar.set_description(desc="Formating Correlations")
+    #             pbar.update(1)
+    #             comps["has_correlation"] = True
+    #             rendered = render_correlation(itmdt)
+    #             comps["correlations"] = components(
+    #                 [
+    #                     _morph_figure(
+    #                         tab.child,
+    #                         sizing_mode="stretch_width",
+    #                         title=Title(
+    #                             text=tab.title, align="center", text_font_size="20px"
+    #                         ),
+    #                     )
+    #                     for tab in rendered.tabs
+    #                 ]
+    #             )
+    #         else:
+    #             pbar.set_description(desc="Skipping Correlations")
+    #             pbar.update(1)
+    #             comps["has_correlation"] = False
+    #     except Exception as error:
+    #         pbar.set_description(desc="Something Happened...")
+    #         pbar.update(2)
+    #         comps["has_correlation"] = True
+    #         comps["correlations"] = (0, {"error": error})  # same template for rendering
+
+    #     # Interactions
+    #     df_coeffs: pd.DataFrame = pd.DataFrame({})
+    #     if len(num_col) > 1:
+    #         comps["has_interaction"] = True
+    #         # set initial x,y axis value
+    #         df_scatter = df.loc[:, num_col]
+    #         df_scatter.loc[:, "__x__"] = df_scatter.iloc[:, 0]
+    #         df_scatter.loc[:, "__y__"] = df_scatter.iloc[:, 0]
+    #         try:
+    #             for v_1 in num_col:
+    #                 for v_2 in num_col:
+    #                     pbar.set_description(
+    #                         desc=f"Computing Interactions: {v_1}-{v_2}"
+    #                     )
+    #                     pbar.update(1)
+    #                     itmdt = compute_correlation(df, v_1, v_2)
+    #                     coeff_a, coeff_b = itmdt["coeffs"]
+    #                     line_x = np.asarray(
+    #                         [
+    #                             itmdt["data"].iloc[:, 0].min(),
+    #                             itmdt["data"].iloc[:, 0].max(),
+    #                         ]
+    #                     )
+    #                     line_y = coeff_a * line_x + coeff_b
+    #                     df_coeffs[f"{v_1}{v_2}x"] = line_x
+    #                     df_coeffs[f"{v_1}{v_2}y"] = line_y
+    #             df_coeffs.loc[:, "__x__"] = df_coeffs.iloc[:, 0]
+    #             df_coeffs.loc[:, "__y__"] = df_coeffs.iloc[:, 1]
+    #             itmdt = Intermediate(
+    #                 coeffs=df_coeffs,
+    #                 data=df_scatter,
+    #                 visual_type="correlation_crossfilter",
+    #             )
+    #             pbar.set_description(desc="Formating Interactions")
+    #             pbar.update(1)
+    #             rendered = render_correlation(itmdt)
+    #             comps["interactions"] = components(
+    #                 _morph_figure(rendered, sizing_mode="stretch_width")
+    #             )
+    #         except Exception as error:
+    #             pbar.set_description(desc="Something Happened...")
+    #             pbar.update(1)
+    #             comps["interactions"] = (0, {"error": error})
+    #     else:
+    #         pbar.set_description(desc="Skipping Interactions")
+    #         pbar.update(len(num_col) ** 2 + 1)
+    #         comps["has_interaction"] = False
+    #     pbar.set_description(desc="Report has been created!")
+    # return comps
 
 
 # def format_full(
