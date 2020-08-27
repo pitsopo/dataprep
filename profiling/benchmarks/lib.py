@@ -1,16 +1,18 @@
 import sys
-from time import time
 from json import dumps as jdumps
 from pathlib import Path
+from time import time
 
 PWD = Path(__file__).resolve().parent.parent
 
 
 class Benchmark:
+    reader: str
     dpath: Path
 
     def __init__(self):
-        self.dpath = PWD / "data" / sys.argv[1]
+        self.reader = sys.argv[1]
+        self.dpath = PWD / "data" / sys.argv[2]
 
     def run(self) -> None:
         then = time()

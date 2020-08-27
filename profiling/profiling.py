@@ -43,11 +43,13 @@ def grid() -> ParameterGrid:
     return ParameterGrid(
         {
             "dataset": ["adult"],
-            "memory": [1 * G, 2 * G, 4 * G, 8 * G],
+            "memory": [1 * G],
             "cpu": [8],
             "fname": fnames,
-            "nrow": [50000, 500000, 5000000, 10000000],
+            "nrow": [7000000],
             "ncol": [12],
+            "format": ["csv", "parquet"],
+            "reader": ["pandas", "dask"],
             "partition": [16],
         }
     )
@@ -71,12 +73,26 @@ def main() -> None:
     running_jobs = {}
 
     for args in grid():
+        create_dataset(
+            args["dataset"],
+            args["nrow"],
+            args["ncol"],
+            format=args["format"],
+            partition=args["partition"],
+        )
+
+    for args in grid():
         mem = args["memory"]
         cpu = args["cpu"]
         fname = args["fname"]
+        reader = args["reader"]
 
         dpath, size_in_mem = create_dataset(
-            args["dataset"], args["nrow"], args["ncol"], args["partition"]
+            args["dataset"],
+            args["nrow"],
+            args["ncol"],
+            format=args["format"],
+            partition=args["partition"],
         )
         args["mem_size"] = size_in_mem
 
@@ -116,7 +132,7 @@ def main() -> None:
 
         job = dclient.containers.run(
             "wooya/dataprep-profiling",
-            f"python benchmarks/{fname} {dpath}",
+            f"python benchmarks/{fname} {reader} {dpath}",
             detach=True,
             volumes={
                 str(PWD.parent / "dataprep"): {
@@ -179,14 +195,18 @@ def create_dataset(
     dataset: Path,
     nrow: int,
     ncol: int,
+    format: str = "csv",
     partition: Optional[int] = None,
     skip: bool = True,
 ) -> Tuple[str, float]:
-    fname = f"{dataset}_{nrow}_{ncol}_{partition}.pq"
+    fname = f"{dataset}_{nrow}_{ncol}_{partition}.{format}"
     fpath = PWD / "data" / fname
 
     if skip and fpath.exists():
-        size_in_mem = pd.read_parquet(fpath).memory_usage(deep=True).sum()
+        if format == "csv":
+            size_in_mem = pd.read_csv(fpath).memory_usage(deep=True).sum()
+        elif format == "parquet":
+            size_in_mem = pd.read_parquet(fpath).memory_usage(deep=True).sum()
 
         return fname, size_in_mem
 
@@ -204,12 +224,14 @@ def create_dataset(
 
     df.reset_index(inplace=True)
     size_in_mem = df.memory_usage(deep=True).sum()
-
-    if partition is not None:
-        df["index"] = df["index"] % int(partition)
-        df.to_parquet(fpath, partition_cols=["index"])
-    else:
-        df.to_parquet(fpath)
+    if format == "parquet":
+        if partition is not None:
+            df["index"] = df["index"] % int(partition)
+            df.to_parquet(fpath, partition_cols=["index"])
+        else:
+            df.to_parquet(fpath)
+    elif format == "csv":
+        df.to_csv(fpath)
 
     # release the memory
     del df
