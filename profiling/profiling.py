@@ -42,14 +42,14 @@ def grid() -> ParameterGrid:
 
     return ParameterGrid(
         {
-            "dataset": ["adult"],
+            "dataset": ["nums"],
             "memory": [1 * G],
             "cpu": [8],
             "fname": fnames,
-            "nrow": [7000000],
-            "ncol": [12],
-            "format": ["csv", "parquet"],
-            "reader": ["pandas", "dask"],
+            "nrow": [7000000, 10000000],
+            "ncol": [30],
+            "format": ["parquet", "csv"],
+            "reader": ["pandas"],
             "partition": [16],
         }
     )

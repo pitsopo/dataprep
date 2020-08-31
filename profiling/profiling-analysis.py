@@ -5,7 +5,7 @@ from json import loads
 
 G = 1024 * 1024 * 1024
 ##
-df = pd.read_json("results/adult_dask_corr_1.json", lines=True)
+df = pd.read_json("results/num_perf.json", lines=True)
 df["DVM"] = df["mem_size"] / df["memory"]
 df["MachineMem"] = df["memory"].apply(lambda value: f"{value / G:.1f}G")
 df["DatasetMemSize"] = df["mem_size"].apply(lambda value: f"{value / G:.1f}G")
